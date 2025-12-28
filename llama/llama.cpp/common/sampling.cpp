@@ -8,6 +8,13 @@
 #include <cstring>
 #include <unordered_map>
 
+//bstr156: Auxiliary RNG option
+extern "C" void llama_sampler_apply_with_ctx(
+    struct llama_sampler * smpl,
+    struct llama_context * ctx,
+    struct llama_token_data_array * cur_p
+);
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -423,7 +430,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     gsmpl->set_logits(ctx, idx);
 
-    llama_sampler_apply(chain, &cur_p);
+    //bstr156
+    llama_sampler_apply_with_ctx(chain, ctx, &cur_p);
+
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 

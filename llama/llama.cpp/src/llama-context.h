@@ -315,4 +315,18 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    
+// bstr156: --- sampling auxiliary RNG provider (optional; default off) ---
+public:
+    void set_auxrng_provider(llama_auxrng_cb cb, void * ud) {
+        auxrng_cb = cb;
+        auxrng_ud = ud;
+    }
+
+    llama_auxrng_cb get_auxrng_cb() const { return auxrng_cb; }
+    void * get_auxrng_ud() const { return auxrng_ud; }
+
+private:
+    llama_auxrng_cb auxrng_cb = nullptr;
+    void * auxrng_ud = nullptr;
 };
