@@ -4,6 +4,83 @@
   </a>
 </div>
 
+# Ollama AuxRNG
+
+This fork of Ollama introduces **AuxRNG**: an *optional* auxiliary randomness source that can be specified at runtime for use during token sampling.
+
+With this, Ollama can draw from any byte-producing device node for sampling decisions instead of using the default internal PRNG path. The model weights do **not** change — only the sampler's randomness stream does.
+
+> AuxRNG is meant for experimentation and research work and is especially useful for those interested in supplying "true/quantum randomness" to LLMs. If you don’t explicitly enable it, this Ollama behaves the same as upstream (PRNG).
+
+---
+
+## What is AuxRNG?
+
+**AuxRNG** is a small integration point that provides an environment hook `OLLAMA_AUXRNG_DEV` by which the runtime will pull bytes from a specified external device node (e.g. a hardware TRNG like `/dev/ttyACM0`) and feed those bytes to the sampler.
+
+- Does **not** change model files, prompts, or the REST API schema
+- Works with any model you run through Ollama
+- Can be enabled/disabled at runtime (via environment)
+- Throughput/latency depends on your device and how you read from it
+
+If the environment hook is undefined, or cannot be opened or read, Ollama falls back to default internal PRNG behavior (and logs accordingly).
+
+AuxRNG is device-agnostic; technically it can read from any device node that produces bytes, though its intended use here involves TRNG or QRNG devices.
+
+---
+
+## Quick Start
+
+### 1) Identify the node path of your auxiliary device or randomness source
+
+Examples:
+
+- `/dev/ttyACM0` (typical of TrueRNGpro V2 hardware RNG)
+- `/dev/urandom` (Linux kernel-provided cryptographic pseudorandom byte stream)
+
+### 2) Ensure that filesystem permissions allow the device to be read
+
+On many Linux distros, the user that will serve Llama needs to be added to the `dialout` group so that Llama can read from the serial device:
+
+```bash
+sudo usermod -aG dialout "$USER"
+# then log out/in
+```
+
+### 3) (Optional but recommended) Install official Ollama to establish GPU support libraries and a convenient side-by-side testing environment.
+
+GPU (CUDA) libaries are included with the official Ollama installation. The custom ollama-auxrng binary will use those. If you don't have it and you want GPU support and/or a side-by-side testing environment, install it.
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+### 4) Clone AuxRNG, build
+
+```bash
+git clone https://github.com/orphiceye/ollama-auxrng.git ~/
+cd ~/ollama-auxrng
+go clean -cache
+# We will place the auxrng binary at the same install path use by the official Ollama installation (typically /usr/local/bin/).
+# This helps the auxrng find CUDA libs at runtime.
+go build -buildvcs=false -o /usr/local/bin/ollama-auxrng
+```
+
+### 5) Set the environment and launch
+
+I recommend using an alternative port like 11435 to avoid clashing with any standard Ollama instance on 11434. In this manner they can run side-by-side.
+
+```bash
+#Environment variables
+OLLAMA_HOST=http://0.0.0.0:11435 \
+OLLAMA_MODELS=/path/to/your/existing/models \
+OLLAMA_AUXRNG_DEV=/dev/yourDeviceNode \
+
+#Launch
+/usr/local/bin/ollama-auxrng serve .
+```
+
+Upstream README
 # Ollama
 
 Get up and running with large language models.
