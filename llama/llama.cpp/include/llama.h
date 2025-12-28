@@ -398,6 +398,13 @@ extern "C" {
         const char * content;
     } llama_chat_message;
 
+    // bstr156: Auxiliary RNG option
+    // If set, llama.cpp will use this for uniform RNG draws during sampling. 
+    typedef bool (*llama_auxrng_cb)(void * user_data, uint8_t * out, size_t n);
+    // If cb is NULL, clears the auxiliary RNG provider.
+    LLAMA_API void llama_set_auxrng_provider(struct llama_context * ctx, llama_auxrng_cb cb, void * user_data);
+
+
     // lora adapter
     struct llama_adapter_lora;
 
@@ -1182,6 +1189,7 @@ extern "C" {
     LLAMA_API const char *           llama_sampler_name  (const struct llama_sampler * smpl);
     LLAMA_API void                   llama_sampler_accept(      struct llama_sampler * smpl, llama_token token);
     LLAMA_API void                   llama_sampler_apply (      struct llama_sampler * smpl, llama_token_data_array * cur_p);
+
     LLAMA_API void                   llama_sampler_reset (      struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_clone (const struct llama_sampler * smpl);
     // important: do not free if the sampler has been added to a llama_sampler_chain (via llama_sampler_chain_add)

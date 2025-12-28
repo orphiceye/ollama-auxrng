@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "llama-auxrng.h"
+
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -477,6 +479,7 @@ llama_context::~llama_context() {
     //     }
     // }
     ggml_opt_free(opt_ctx);
+    llama_auxrng_cleanup(this); //bstr156
 }
 
 void llama_context::synchronize() {
@@ -2452,6 +2455,7 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+        llama_auxrng_try_enable_from_env(ctx); //bstr156: Auxiliary RNG option
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
@@ -2552,6 +2556,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_logits_ith(i);
+}
+
+// bstr156: Auxiliary RNG option
+void llama_set_auxrng_provider(llama_context * ctx, llama_auxrng_cb cb, void * user_data) {
+    if (!ctx) return;
+    ctx->set_auxrng_provider(cb, user_data);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

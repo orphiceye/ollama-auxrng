@@ -1,4 +1,5 @@
 #include "llama-sampling.h"
+#include "llama-context.h"
 
 #include "llama-impl.h"
 #include "llama-vocab.h"
@@ -17,6 +18,96 @@
 #include <random>
 #include <unordered_map>
 #include <stdexcept>
+
+
+
+// bstr156: optional auxiliary RNG provider (thread-local)
+//
+// We stash the current llama_context in TLS for the duration of sampling so the
+// sampler can call ctx's RNG provider without changing a bunch of interfaces.
+static thread_local llama_context * tls_auxrng_ctx = nullptr;
+
+// Rate-limited debug (optional)
+static thread_local uint64_t tls_auxrng_reads = 0;
+
+static inline llama_auxrng_cb tls_get_auxrng_cb() {
+    return tls_auxrng_ctx ? tls_auxrng_ctx->get_auxrng_cb() : nullptr;
+}
+
+static inline void * tls_get_auxrng_ud() {
+    return tls_auxrng_ctx ? tls_auxrng_ctx->get_auxrng_ud() : nullptr;
+}
+
+static inline bool tls_auxrng_fill(uint8_t * out, size_t n) {
+    llama_auxrng_cb cb = tls_get_auxrng_cb();
+    if (!cb) return false;
+
+    const bool ok = cb(tls_get_auxrng_ud(), out, n);
+
+    // Optional rate-limited logging. Keep off / gated for upstream.
+    // tls_auxrng_reads++;
+    // if (tls_auxrng_reads <= 10 || (tls_auxrng_reads & 0xFFF) == 0) {
+    //     LLAMA_LOG_INFO("RNG: tls_auxrng_fill(n=%zu) ok=%d cnt=%llu\n",
+    //         n, ok ? 1 : 0, (unsigned long long) tls_auxrng_reads);
+    // }
+
+    return ok;
+}
+
+// Wrap mt19937 so uniform_real_distribution can draw from the auxiliary RNG
+// while preserving the exact fallback behavior.
+struct rng_mt19937_wrapper {
+    using result_type = std::mt19937::result_type;
+
+    std::mt19937 & fallback;
+
+    explicit rng_mt19937_wrapper(std::mt19937 & r) : fallback(r) {}
+
+    static constexpr result_type min() { return std::mt19937::min(); }
+    static constexpr result_type max() { return std::mt19937::max(); }
+
+    result_type operator()() {
+        result_type x = 0;
+        if (tls_auxrng_fill(reinterpret_cast<uint8_t *>(&x), sizeof(x))) {
+            return x;
+        }
+        return fallback();
+    }
+};
+
+// Convert 64 bits to a uniform double in [0,1).
+static inline double llama_uniform01_f64(std::mt19937 & rng) {
+    uint64_t x = 0;
+    if (tls_auxrng_fill(reinterpret_cast<uint8_t *>(&x), sizeof(x))) {
+        static thread_local uint64_t tls_calls = 0;
+        const uint64_t call_n = ++tls_calls;
+
+        const uint64_t mantissa = x >> 11; // keep top 53 bits
+        const double u = (double) mantissa * (1.0 / 9007199254740992.0); // 2^53
+
+        LLAMA_LOG_INFO(
+            "Auxiliary RNG: uniform01_f64 callcount=%llu x=0x%016llx mant=0x%013llx u=%.17g\n",
+            (unsigned long long) call_n,
+            (unsigned long long) x,
+            (unsigned long long) mantissa,
+            u
+        );
+
+        return u;
+    }
+
+    // fallback: identical to previous behavior
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(rng);
+}
+
+static inline float llama_uniform01_f32(std::mt19937 & rng) {
+    const double d = llama_uniform01_f64(rng);
+    return (float) d;
+}
+
+
+
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 template<typename T>
@@ -241,6 +332,11 @@ static int llama_sample_dist(llama_token_data_array * cur_p, std::mt19937 & rng)
 
     std::discrete_distribution<int> dist(probs_iterator{cur_p->data}, probs_iterator{cur_p->data + cur_p->size});
 
+    // bstr156: use Custom RNG provider when configured; otherwise fall back to existing RNG
+    if (tls_get_auxrng_cb() != nullptr) {
+        rng_mt19937_wrapper erng(rng);
+        return dist(erng);
+    }
     return dist(rng);
 }
 
@@ -331,7 +427,7 @@ static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) 
     cur_p->size = k;
 }
 
-static uint32_t get_rng_seed(uint32_t seed) {
+static uint32_t get_auxrng_seed(uint32_t seed) {
     if (seed == LLAMA_DEFAULT_SEED) {
         // use system clock if std::random_device is not a true RNG
         static bool is_rd_prng = std::random_device().entropy() == 0;
@@ -372,6 +468,7 @@ void llama_sampler_apply(struct llama_sampler * smpl, struct llama_token_data_ar
     smpl->iface->apply(smpl, cur_p);
 }
 
+
 void llama_sampler_reset(struct llama_sampler * smpl) {
     if (smpl->iface->reset) {
         smpl->iface->reset(smpl);
@@ -405,7 +502,33 @@ void llama_sampler_free(struct llama_sampler * smpl) {
     delete smpl;
 }
 
+//bstr156: optional auxiliary RNG option
+struct tls_auxrng_guard {
+    llama_context * prev = nullptr;
+
+    explicit tls_auxrng_guard(llama_context * ctx) {
+        prev = tls_auxrng_ctx;
+        tls_auxrng_ctx = ctx;
+    }
+
+    ~tls_auxrng_guard() {
+        tls_auxrng_ctx = prev;
+    }
+};
+
+extern "C" void llama_sampler_apply_with_ctx(
+    struct llama_sampler * smpl,
+    struct llama_context * ctx,
+    struct llama_token_data_array * cur_p
+) {
+    tls_auxrng_guard guard(ctx);
+    llama_sampler_apply(smpl, cur_p);
+}
+
+
 llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_context * ctx, int32_t idx) {
+    tls_auxrng_guard guard(ctx);
+
     const auto * logits = llama_get_logits_ith(ctx, idx);
 
     const llama_model * model = llama_get_model(ctx);
@@ -635,8 +758,11 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
     // sample from the obtained probabilities and normalize the probs in a single pass
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below
     //
-    std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const double rnd = dist(ctx->rng);
+
+    //bstr156
+    const double rnd = llama_uniform01_f64(ctx->rng);
+    //std::uniform_real_distribution<double> dist(0.0f, 1.0f);
+    //const double rnd = dist(ctx->rng);
 
           double sum_run = 0.0f;
     const double sum_tgt = sum_cum*rnd;
@@ -687,7 +813,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
 
 static void llama_sampler_dist_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_dist *) smpl->ctx;
-    ctx->seed_cur = get_rng_seed(ctx->seed);
+    ctx->seed_cur = get_auxrng_seed(ctx->seed);
     ctx->rng.seed(ctx->seed_cur);
 }
 
@@ -705,7 +831,7 @@ static struct llama_sampler_i llama_sampler_dist_i = {
 };
 
 struct llama_sampler * llama_sampler_init_dist(uint32_t seed) {
-    auto seed_cur = get_rng_seed(seed);
+    auto seed_cur = get_auxrng_seed(seed);
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_dist_i,
         /* .ctx   = */ new llama_sampler_dist {
@@ -1228,8 +1354,10 @@ static void llama_sample_xtc_apply(struct llama_sampler * smpl, llama_token_data
         return;
     }
 
-    std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
-    float chance = distribution(ctx->rng);
+    //bstr156
+    float chance = llama_uniform01_f32(ctx->rng);
+    //std::uniform_real_distribution<float> distribution(0.0f, 1.0f);
+    //float chance = distribution(ctx->rng);
     if (chance > ctx->probability) {
         return;
     }
@@ -1272,7 +1400,7 @@ static void llama_sampler_xtc_free(struct llama_sampler * smpl) {
 
 static void llama_sampler_xtc_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_xtc *) smpl->ctx;
-    ctx->seed_cur = get_rng_seed(ctx->seed);
+    ctx->seed_cur = get_auxrng_seed(ctx->seed);
     ctx->rng.seed(ctx->seed_cur);
 }
 
@@ -1286,7 +1414,7 @@ static struct llama_sampler_i llama_sampler_xtc_i = {
 };
 
 struct llama_sampler * llama_sampler_init_xtc(float p, float t, size_t min_keep, uint32_t seed) {
-    auto seed_cur = get_rng_seed(seed);
+    auto seed_cur = get_auxrng_seed(seed);
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_xtc_i,
         /* .ctx   = */ new llama_sampler_xtc {
@@ -1376,7 +1504,7 @@ static struct llama_sampler * llama_sampler_mirostat_clone(const struct llama_sa
 static void llama_sampler_mirostat_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_mirostat *) smpl->ctx;
     ctx->mu = 2.0f*ctx->tau;
-    ctx->seed_cur = get_rng_seed(ctx->seed);
+    ctx->seed_cur = get_auxrng_seed(ctx->seed);
     ctx->rng.seed(ctx->seed_cur);
 }
 
@@ -1394,7 +1522,7 @@ static struct llama_sampler_i llama_sampler_mirostat_i = {
 };
 
 struct llama_sampler * llama_sampler_init_mirostat(int32_t n_vocab, uint32_t seed, float tau, float eta, int32_t m) {
-    auto seed_cur = get_rng_seed(seed);
+    auto seed_cur = get_auxrng_seed(seed);
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_mirostat_i,
         /* .ctx   = */ new llama_sampler_mirostat {
@@ -1459,7 +1587,7 @@ static void llama_sampler_mirostat_v2_apply(struct llama_sampler * smpl, llama_t
 static void llama_sampler_mirostat_v2_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_mirostat_v2 *) smpl->ctx;
     ctx->mu = 2.0f*ctx->tau;
-    ctx->seed_cur = get_rng_seed(ctx->seed);
+    ctx->seed_cur = get_auxrng_seed(ctx->seed);
     ctx->rng.seed(ctx->seed_cur);
 }
 
@@ -1493,7 +1621,7 @@ static struct llama_sampler_i llama_sampler_mirostat_v2_i = {
 };
 
 struct llama_sampler * llama_sampler_init_mirostat_v2(uint32_t seed, float tau, float eta) {
-    auto seed_cur = get_rng_seed(seed);
+    auto seed_cur = get_auxrng_seed(seed);
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_mirostat_v2_i,
         /* .ctx   = */ new llama_sampler_mirostat_v2 {
