@@ -47,7 +47,7 @@ Examples:
 
 ### 2) Ensure that filesystem permissions allow the device to be read
 
-On many Linux distros, the user that will serve Llama needs to be added to the `dialout` group so that Llama can read from the serial device:
+On many Linux distros, the user that will serve Ollama needs to be added to the `dialout` group so that Ollama can read from the serial device:
 
 ```bash
 sudo usermod -aG dialout "$USER"
@@ -56,7 +56,7 @@ sudo usermod -aG dialout "$USER"
 
 ### 3) (Optional but recommended) Install official Ollama to establish GPU support libraries and a convenient side-by-side testing environment.
 
-GPU (CUDA) libaries are included with the official Ollama installation. The custom ollama-auxrng binary will use those. If you don't have it and you want GPU support and/or a side-by-side testing environment, install it.
+GPU (CUDA) libraries are included with the official Ollama installation. The custom ollama-auxrng binary will use those. If you don't have it and you want GPU support and/or a side-by-side testing environment, install it.
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
